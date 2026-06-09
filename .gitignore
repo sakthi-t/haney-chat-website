@@ -39,3 +39,15 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+.haney/
+
+# haney project files
+plan.md
+sessions.md
+Agents.md
+claude.md
+help.md
+memory.md
+system.md
+

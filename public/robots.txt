@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://haney-chat.netlify.app/sitemap.xml
