@@ -8,40 +8,87 @@ import { UserButton } from "@clerk/nextjs";
 import { SidebarClient } from "@/components/sidebar-client";
 import { MobileSidebar } from "@/components/mobile-sidebar";
 
+async function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function syncUser(
   clerkUserId: string,
   email: string | null,
   username: string | null,
-  role: string | null
-) {
+  role: string | null,
+  attempt = 0
+): Promise<string> {
   const finalRole = role === "admin" || role === "user" ? role : "user";
 
-  const existing = await db
-    .select()
-    .from(schema.users)
-    .where(eq(schema.users.clerkUserId, clerkUserId))
-    .limit(1);
+  try {
+    const existing = await db
+      .select()
+      .from(schema.users)
+      .where(eq(schema.users.clerkUserId, clerkUserId))
+      .limit(1);
 
-  if (existing.length === 0) {
-    await db.insert(schema.users).values({
-      clerkUserId,
-      email,
-      username,
-      role: finalRole,
-    });
-  } else {
-    await db
-      .update(schema.users)
-      .set({
+    if (existing.length === 0) {
+      await db.insert(schema.users).values({
+        clerkUserId,
         email,
         username,
         role: finalRole,
-        updatedAt: new Date(),
-      })
-      .where(eq(schema.users.clerkUserId, clerkUserId));
-  }
+      });
+    } else {
+      await db
+        .update(schema.users)
+        .set({
+          email,
+          username,
+          role: finalRole,
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.users.clerkUserId, clerkUserId));
+    }
 
-  return finalRole;
+    return finalRole;
+  } catch (err) {
+    // Retry up to 2 more times with exponential backoff (1s, 2s)
+    // Supabase free tier pauses after inactivity — first request wakes it
+    if (attempt < 2) {
+      console.warn(
+        `syncUser failed (attempt ${attempt + 1}/3), retrying in ${Math.pow(2, attempt)}s...`,
+        (err as Error).message
+      );
+      await delay(Math.pow(2, attempt) * 1000);
+      return syncUser(clerkUserId, email, username, role, attempt + 1);
+    }
+    // All retries exhausted — log and return the best-guess role.
+    // The user can still chat; the API route will upsert on first message.
+    console.error("syncUser failed after 3 attempts:", (err as Error).message);
+    return finalRole;
+  }
+}
+
+async function getDbUserId(
+  clerkUserId: string,
+  attempt = 0
+): Promise<string | null> {
+  try {
+    const rows = await db
+      .select({ id: schema.users.id })
+      .from(schema.users)
+      .where(eq(schema.users.clerkUserId, clerkUserId))
+      .limit(1);
+    return rows.length > 0 ? rows[0].id : null;
+  } catch (err) {
+    if (attempt < 2) {
+      console.warn(
+        `getDbUserId failed (attempt ${attempt + 1}/3), retrying...`,
+        (err as Error).message
+      );
+      await delay(Math.pow(2, attempt) * 1000);
+      return getDbUserId(clerkUserId, attempt + 1);
+    }
+    console.error("getDbUserId failed after 3 attempts:", (err as Error).message);
+    return null;
+  }
 }
 
 export default async function DashboardLayout({
@@ -58,6 +105,7 @@ export default async function DashboardLayout({
   // Fetch full user profile from Clerk and sync to Supabase
   let role = "user";
   let dbUserId: string | null = null;
+
   try {
     const user = await currentUser();
     if (user) {
@@ -69,21 +117,23 @@ export default async function DashboardLayout({
         user.username ?? null,
         clerkRole
       );
+
+      // Resolve internal user id for conversation queries
+      dbUserId = await getDbUserId(userId);
     }
   } catch (err) {
+    // If Clerk API is unreachable (cold start / network), we still have
+    // the auth session. Use a best-effort approach: the user can chat,
+    // and user records are upserted inside API routes on first message.
     console.error("Failed to sync user:", err);
-  }
 
-  // Resolve internal user id for conversation queries
-  try {
-    const rows = await db
-      .select({ id: schema.users.id })
-      .from(schema.users)
-      .where(eq(schema.users.clerkUserId, userId))
-      .limit(1);
-    if (rows.length > 0) dbUserId = rows[0].id;
-  } catch (err) {
-    console.error("Failed to get user id:", err);
+    // Try once more to get the DB user id (syncUser may have succeeded
+    // even if currentUser failed on retry)
+    try {
+      dbUserId = await getDbUserId(userId);
+    } catch {
+      // Proceed without a DB user id — API routes handle upsert on write
+    }
   }
 
   // Fetch conversations server-side

@@ -2,6 +2,7 @@
 
 import { useState, useEffect } from "react";
 import { SignIn, SignUp, useClerk, useAuth } from "@clerk/nextjs";
+import { useRouter } from "next/navigation";
 import { cn } from "@/lib/utils";
 import { Loader2, ArrowRight, AlertTriangle } from "lucide-react";
 import Link from "next/link";
@@ -60,13 +61,19 @@ export function AuthSwitcher() {
   const [mode, setMode] = useState<AuthMode>("sign-in");
   const clerk = useClerk();
   const { isSignedIn } = useAuth();
+  const router = useRouter();
 
   // If already signed in (e.g., Clerk JS loaded late and detected session),
-  // redirect to /chat immediately
-  if (isSignedIn) {
-    if (typeof window !== "undefined") {
-      window.location.href = "/chat";
+  // redirect to /chat via Next.js router — avoids full page reload that can
+  // race with cookie propagation on cold starts
+  useEffect(() => {
+    if (isSignedIn && clerk.loaded) {
+      router.push("/chat");
     }
+  }, [isSignedIn, clerk.loaded, router]);
+
+  // Still loading or about to redirect — show nothing
+  if (isSignedIn) {
     return null;
   }
 

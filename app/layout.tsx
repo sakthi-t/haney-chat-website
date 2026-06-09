@@ -56,6 +56,8 @@ export default function RootLayout({
   return (
     <ClerkProvider
       afterSignOutUrl="/"
+      signInFallbackRedirectUrl="/chat"
+      signUpFallbackRedirectUrl="/chat"
       appearance={{
         variables: {
           colorPrimary: "#a855f7",
