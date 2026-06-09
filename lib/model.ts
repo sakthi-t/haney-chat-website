@@ -29,21 +29,101 @@ interface ModalChatResponse {
   choices: ModalChatChoice[];
 }
 
+// ── Special token stripping ────────────────────────────────────────────
+// Chat-template models (537M class) often emit literal tokens like
+// <|assistant|>, <|im_start|>, <s>, [/INST] etc. If these are saved to
+// the DB and fed back into the next turn's conversation, they compound
+// and cause the model to drift / break.  This function strips them from
+// both input (before sending) and output (before saving).
+const SPECIAL_TOKENS = [
+  // ChatML family
+  /<\|im_start\|>/gi,
+  /<\|im_end\|>/gi,
+  /<\|assistant\|>/gi,
+  /<\|user\|>/gi,
+  /<\|system\|>/gi,
+  /<\|endoftext\|>/gi,
+  // Llama family
+  /\[INST\]/gi,
+  /\[\/INST\]/gi,
+  /<<SYS>>/gi,
+  /<<\/SYS>>/gi,
+  /<\/s>/gi,
+  /<s>/gi,
+  // Gemma
+  /<bos>/gi,
+  /<eos>/gi,
+  /<start_of_turn>/gi,
+  /<end_of_turn>/gi,
+  // Anthropic
+  /<\|Human:\|>/gi,
+  /<\|Assistant:\|>/gi,
+  // Generic
+  /<\|.*?\|>/gi, // catch-all for angle-bracket tokens
+];
+
+const SYSTEM_PROMPT =
+  "You are Haney Chat, a helpful AI assistant. " +
+  "Answer clearly and concisely. Stay on topic. " +
+  "Do not repeat special tokens or formatting delimiters.";
+
+export function stripSpecialTokens(text: string): string {
+  let cleaned = text;
+  for (const pattern of SPECIAL_TOKENS) {
+    cleaned = cleaned.replace(pattern, "");
+  }
+  // Normalise whitespace that may have been left behind
+  return cleaned.replace(/\s{2,}/g, " ").trim();
+}
+
 function convertLangChainMessageToModal(
   msg: BaseMessage
 ): { role: string; content: string } {
+  const content = stripSpecialTokens(msg.content as string);
+
   if (msg instanceof HumanMessage) {
-    return { role: "user", content: msg.content as string };
+    return { role: "user", content };
   }
   if (msg instanceof AIMessage) {
-    return { role: "assistant", content: msg.content as string };
+    return { role: "assistant", content };
   }
   if (msg instanceof SystemMessage) {
-    return { role: "system", content: msg.content as string };
+    return { role: "system", content };
   }
   // Fallback — treat _getType() as role
   const role = msg._getType?.() ?? "user";
-  return { role: role === "ai" ? "assistant" : role, content: msg.content as string };
+  return { role: role === "ai" ? "assistant" : role, content };
+}
+
+/**
+ * Build the full prompt array for a request — prepends system prompt
+ * and sanitises every message.  Also logs prompt details for debugging.
+ */
+function buildPrompt(messages: BaseMessage[]): { role: string; content: string }[] {
+  const all: BaseMessage[] = [
+    new SystemMessage(SYSTEM_PROMPT),
+    ...messages,
+  ];
+
+  const prompt = all.map(convertLangChainMessageToModal);
+
+  // ── Logging ──
+  const totalChars = prompt.reduce((sum, m) => sum + m.content.length, 0);
+  console.log(
+    `[model] prompt — ${prompt.length} messages, ${totalChars} chars, ~${Math.round(totalChars / 4)} tokens`
+  );
+  if (prompt.length > 1) {
+    const last5 = prompt.slice(-5);
+    console.log("[model] last 5 prompt messages:");
+    last5.forEach((m, i) => {
+      const preview = m.content.length > 200
+        ? m.content.slice(0, 200) + "..."
+        : m.content;
+      console.log(`  [${i + 1}] ${m.role}: ${preview}`);
+    });
+  }
+
+  return prompt;
 }
 
 /**
@@ -66,7 +146,7 @@ export class HaneyChatModel extends BaseChatModel {
   ): Promise<ChatResult> {
     const body = {
       model: "haney-chat",
-      messages: messages.map(convertLangChainMessageToModal),
+      messages: buildPrompt(messages),
     };
 
     const response = await fetch(MODEL_API, {
@@ -84,7 +164,8 @@ export class HaneyChatModel extends BaseChatModel {
 
     const data: ModalChatResponse = await response.json();
 
-    const content = data.choices?.[0]?.message?.content ?? "";
+    const rawContent = data.choices?.[0]?.message?.content ?? "";
+    const content = stripSpecialTokens(rawContent);
     const message = new AIMessage(content);
 
     return {
@@ -106,7 +187,7 @@ export class HaneyChatModel extends BaseChatModel {
   ): AsyncGenerator<ChatGenerationChunk> {
     const body = {
       model: "haney-chat",
-      messages: messages.map(convertLangChainMessageToModal),
+      messages: buildPrompt(messages),
       stream: true,
     };
 
@@ -164,7 +245,8 @@ export class HaneyChatModel extends BaseChatModel {
       // ── Plain JSON (Modal ignores stream:true) ──
       try {
         const data: ModalChatResponse = JSON.parse(raw);
-        const content = data.choices?.[0]?.message?.content ?? "";
+        const rawContent = data.choices?.[0]?.message?.content ?? "";
+        const content = stripSpecialTokens(rawContent);
         if (content) {
           // Yield word-by-word instead of character-by-character.
           // No artificial delay — yields as fast as the consumer
@@ -202,10 +284,11 @@ export class HaneyChatModel extends BaseChatModel {
       try {
         const chunk = JSON.parse(jsonStr) as ModalChatResponse;
         const choice = chunk.choices?.[0];
-        const delta =
+        const rawDelta =
           (choice as any)?.delta?.content ??
           choice?.message?.content ??
           "";
+        const delta = stripSpecialTokens(rawDelta);
         if (!delta) continue;
 
         yield new ChatGenerationChunk({

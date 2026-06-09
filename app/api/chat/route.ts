@@ -2,7 +2,7 @@ import { NextRequest } from "next/server";
 import { auth } from "@clerk/nextjs/server";
 import { eq } from "drizzle-orm";
 import { db, schema } from "@/lib/db";
-import { HaneyChatModel } from "@/lib/model";
+import { HaneyChatModel, stripSpecialTokens } from "@/lib/model";
 import { HumanMessage, AIMessage, BaseMessage } from "@langchain/core/messages";
 import {
   getMessages,
@@ -105,9 +105,30 @@ export async function POST(req: NextRequest) {
   const history = await getMessages(convId);
   const langchainMessages: BaseMessage[] = history.map((m) =>
     m.role === "user"
-      ? new HumanMessage(m.content)
-      : new AIMessage(m.content)
+      ? new HumanMessage(stripSpecialTokens(m.content))
+      : new AIMessage(stripSpecialTokens(m.content))
   );
+
+  // ── Prompt logging ──
+  const totalChars = langchainMessages.reduce(
+    (sum, m) => sum + (m.content as string).length, 0
+  );
+  console.log(
+    `[api/chat] prompt — ${langchainMessages.length} messages, ${totalChars} chars, ~${Math.round(totalChars / 4)} tokens`
+  );
+  if (langchainMessages.length > 0) {
+    const last5 = langchainMessages.slice(-5);
+    console.log("[api/chat] last 5 history messages:");
+    last5.forEach((m, i) => {
+      const preview =
+        (m.content as string).length > 200
+          ? (m.content as string).slice(0, 200) + "..."
+          : (m.content as string);
+      console.log(
+        `  [${i + 1}] ${m._getType()}: ${preview}`
+      );
+    });
+  }
 
   // ── SSE stream ──
   const stream = new ReadableStream({
@@ -147,8 +168,9 @@ export async function POST(req: NextRequest) {
           `[api/chat] response completed — ${fullResponse.length} chars`
         );
 
-        // Save assistant message BEFORE sending "done"
-        await addMessage(convId, "assistant", fullResponse);
+        // Save assistant message BEFORE sending "done" — strip tokens
+        const cleanedResponse = stripSpecialTokens(fullResponse);
+        await addMessage(convId, "assistant", cleanedResponse);
         await touchConversation(convId, userId);
 
         if (fullResponse.length === 0) {
