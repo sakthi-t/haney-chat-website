@@ -168,8 +168,18 @@ export async function POST(req: NextRequest) {
           `[api/chat] response completed — ${fullResponse.length} chars`
         );
 
+        // ── Fix 4: Log full response before/after strip ──
+        console.log("[api/chat] === FULL RESPONSE (BEFORE DB SAVE) ===");
+        console.log(fullResponse);
+        console.log("[api/chat] === END FULL RESPONSE ===");
+
         // Save assistant message BEFORE sending "done" — strip tokens
         const cleanedResponse = stripSpecialTokens(fullResponse);
+
+        console.log("[api/chat] === CLEANED RESPONSE (AFTER STRIP) ===");
+        console.log(cleanedResponse);
+        console.log("[api/chat] === END CLEANED RESPONSE ===");
+
         await addMessage(convId, "assistant", cleanedResponse);
         await touchConversation(convId, userId);
 

@@ -35,31 +35,53 @@ interface ModalChatResponse {
 // the DB and fed back into the next turn's conversation, they compound
 // and cause the model to drift / break.  This function strips them from
 // both input (before sending) and output (before saving).
-const SPECIAL_TOKENS = [
-  // ChatML family
-  /<\|im_start\|>/gi,
-  /<\|im_end\|>/gi,
-  /<\|assistant\|>/gi,
-  /<\|user\|>/gi,
-  /<\|system\|>/gi,
-  /<\|endoftext\|>/gi,
-  // Llama family
-  /\[INST\]/gi,
-  /\[\/INST\]/gi,
-  /<<SYS>>/gi,
-  /<<\/SYS>>/gi,
-  /<\/s>/gi,
-  /<s>/gi,
-  // Gemma
-  /<bos>/gi,
-  /<eos>/gi,
-  /<start_of_turn>/gi,
-  /<end_of_turn>/gi,
-  // Anthropic
-  /<\|Human:\|>/gi,
-  /<\|Assistant:\|>/gi,
-  // Generic
-  /<\|.*?\|>/gi, // catch-all for angle-bracket tokens
+//
+// Patterns are ordered: complete tokens first, then fragments (missing
+// opening <| or closing |>), then partial catch-all.
+const SPECIAL_TOKENS: { pattern: RegExp; label: string }[] = [
+  // ── Complete ChatML tokens ──
+  { pattern: /<\|im_start\|>/gi, label: "<|im_start|>" },
+  { pattern: /<\|im_end\|>/gi, label: "<|im_end|>" },
+  { pattern: /<\|assistant\|>/gi, label: "<|assistant|>" },
+  { pattern: /<\|user\|>/gi, label: "<|user|>" },
+  { pattern: /<\|system\|>/gi, label: "<|system|>" },
+  { pattern: /<\|endoftext\|>/gi, label: "<|endoftext|>" },
+  // ── Complete Llama tokens ──
+  { pattern: /\[INST\]/gi, label: "[INST]" },
+  { pattern: /\[\/INST\]/gi, label: "[/INST]" },
+  { pattern: /<<SYS>>/gi, label: "<<SYS>>" },
+  { pattern: /<<\/SYS>>/gi, label: "<</SYS>>" },
+  { pattern: /<\/s>/gi, label: "</s>" },
+  { pattern: /<s>/gi, label: "<s>" },
+  // ── Complete Gemma tokens ──
+  { pattern: /<bos>/gi, label: "<bos>" },
+  { pattern: /<eos>/gi, label: "<eos>" },
+  { pattern: /<start_of_turn>/gi, label: "<start_of_turn>" },
+  { pattern: /<end_of_turn>/gi, label: "<end_of_turn>" },
+  // ── Complete Anthropic tokens ──
+  { pattern: /<\|Human:\|>/gi, label: "<|Human:|>" },
+  { pattern: /<\|Assistant:\|>/gi, label: "<|Assistant:|>" },
+  // ── Fragments: missing opening <| ──
+  { pattern: /\bassistant\|>/gi, label: "assistant|> (fragment)" },
+  { pattern: /\buser\|>/gi, label: "user|> (fragment)" },
+  { pattern: /\bsystem\|>/gi, label: "system|> (fragment)" },
+  { pattern: /\bim_start\|>/gi, label: "im_start|> (fragment)" },
+  { pattern: /\bim_end\|>/gi, label: "im_end|> (fragment)" },
+  { pattern: /\bendoftext\|>/gi, label: "endoftext|> (fragment)" },
+  // ── Fragments: missing closing |> ──
+  { pattern: /<\|assistant\b/gi, label: "<|assistant (fragment)" },
+  { pattern: /<\|user\b/gi, label: "<|user (fragment)" },
+  { pattern: /<\|system\b/gi, label: "<|system (fragment)" },
+  { pattern: /<\|im_start\b/gi, label: "<|im_start (fragment)" },
+  { pattern: /<\|im_end\b/gi, label: "<|im_end (fragment)" },
+  // ── Fragments: pipe-only (no angle brackets) ──
+  { pattern: /\|assistant\|>/gi, label: "|assistant|> (pipe fragment)" },
+  { pattern: /\|user\|>/gi, label: "|user|> (pipe fragment)" },
+  { pattern: /\|system\|>/gi, label: "|system|> (pipe fragment)" },
+  // ── Partial / corrupted ──
+  { pattern: /\bistant\|>/gi, label: "istant|> (partial)" },
+  // ── Generic catch-all (must be last) ──
+  { pattern: /<\|.*?\|>/gi, label: "<|...|> (generic)" },
 ];
 
 const SYSTEM_PROMPT =
@@ -69,9 +91,22 @@ const SYSTEM_PROMPT =
 
 export function stripSpecialTokens(text: string): string {
   let cleaned = text;
-  for (const pattern of SPECIAL_TOKENS) {
+  const removed: string[] = [];
+
+  for (const { pattern, label } of SPECIAL_TOKENS) {
+    const before = cleaned;
     cleaned = cleaned.replace(pattern, "");
+    if (cleaned !== before) {
+      // Count roughly how many instances were removed
+      const matchCount = before.match(new RegExp(pattern.source, "gi"))?.length ?? 1;
+      removed.push(`${label} x${matchCount}`);
+    }
   }
+
+  if (removed.length > 0) {
+    console.log(`[model] stripSpecialTokens removed: ${removed.join(", ")}`);
+  }
+
   // Normalise whitespace that may have been left behind
   return cleaned.replace(/\s{2,}/g, " ").trim();
 }
@@ -134,16 +169,11 @@ function buildPrompt(messages: BaseMessage[]): { role: string; content: string }
   console.log(
     `[model] prompt — ${prompt.length} messages, ${totalChars} chars, ~${Math.round(totalChars / 4)} tokens`
   );
-  if (prompt.length > 1) {
-    const last5 = prompt.slice(-5);
-    console.log("[model] last 5 prompt messages:");
-    last5.forEach((m, i) => {
-      const preview = m.content.length > 200
-        ? m.content.slice(0, 200) + "..."
-        : m.content;
-      console.log(`  [${i + 1}] ${m.role}: ${preview}`);
-    });
-  }
+  console.log("[model] === FINAL PROMPT ARRAY (SENT TO MODAL) ===");
+  prompt.forEach((m, i) => {
+    console.log(`[${i}] ${m.role}: ${m.content}`);
+  });
+  console.log("[model] === END FINAL PROMPT ===");
 
   return prompt;
 }
@@ -218,6 +248,11 @@ export class HaneyChatModel extends BaseChatModel {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 300_000);
 
+    // ── Fix 2: Log exact request body ──
+    console.log("[model] === FULL REQUEST BODY ===");
+    console.log(JSON.stringify(body, null, 2));
+    console.log("[model] === END REQUEST BODY ===");
+
     console.log("[model] sending request to MODEL_API");
     console.time("[model] modal-fetch");
 
@@ -262,13 +297,28 @@ export class HaneyChatModel extends BaseChatModel {
       `[model] response body received — ${raw.length} raw bytes`
     );
 
+    // ── Fix 2: Log raw response ──
+    console.log("[model] === RAW RESPONSE FROM MODAL ===");
+    console.log(raw.length > 3000 ? raw.slice(0, 3000) + "..." : raw);
+    console.log("[model] === END RAW RESPONSE ===");
+
     // Detect format: SSE starts with "data:", plain JSON starts with "{"
     if (raw.trim().startsWith("{")) {
       // ── Plain JSON (Modal ignores stream:true) ──
       try {
         const data: ModalChatResponse = JSON.parse(raw);
         const rawContent = data.choices?.[0]?.message?.content ?? "";
+
+        // ── Fix 2: Log before/after strip ──
+        console.log("[model] === PARSED CONTENT (BEFORE STRIP) ===");
+        console.log(rawContent);
+        console.log("[model] === END PARSED CONTENT ===");
+
         const content = stripSpecialTokens(rawContent);
+
+        console.log("[model] === PARSED CONTENT (AFTER STRIP) ===");
+        console.log(content);
+        console.log("[model] === END STRIPPED CONTENT ===");
         if (content) {
           // Yield word-by-word instead of character-by-character.
           // No artificial delay — yields as fast as the consumer
