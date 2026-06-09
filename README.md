@@ -77,8 +77,18 @@ cp .env.example .env.local
 Create a `.env.local` file with the following:
 
 ```env
+# Clerk (required)
+NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=
+CLERK_SECRET_KEY=
+CLERK_WEBHOOK_SECRET=
 
+# Supabase (required)
+DATABASE_URL=
+DIRECT_URL=
 ```
+
+> Clerk auto-discovers sign-in/sign-up URLs and JWKS from your publishable key.
+> No `NEXT_PUBLIC_CLERK_*_URL` variables are needed.
 
 ### Database Setup
 
@@ -286,7 +296,6 @@ npm run build
 ```
 
 Configure these environment variables in Netlify dashboard:
-- `MODEL_API`
 - `DATABASE_URL`
 - `DIRECT_URL`
 - `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`
