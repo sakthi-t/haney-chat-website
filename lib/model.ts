@@ -107,8 +107,30 @@ function buildPrompt(messages: BaseMessage[]): { role: string; content: string }
 
   const prompt = all.map(convertLangChainMessageToModal);
 
+  // ── Sliding window: keep newest messages, drop oldest ──
+  // Modal truncates prompt to 1000 chars. We budget 850 for content,
+  // leaving ~150 for JSON overhead (keys, quotes, braces, field names).
+  const MAX_CONTENT_CHARS = 850;
+  let totalChars = prompt.reduce((sum, m) => sum + m.content.length, 0);
+  let dropped = 0;
+
+  // Always keep the system message (index 0) and the last 2 non-system
+  // messages so the newest user→assistant exchange is always preserved.
+  while (totalChars > MAX_CONTENT_CHARS && prompt.length > 3) {
+    // Remove the oldest non-system message (index 1 — right after system)
+    const removed = prompt.splice(1, 1)[0]!;
+    totalChars -= removed.content.length;
+    dropped++;
+  }
+
+  if (dropped > 0) {
+    console.log(
+      `[model] prompt truncated — dropped ${dropped} oldest message(s), ` +
+      `${prompt.length} remaining, ${totalChars} chars (budget: ${MAX_CONTENT_CHARS})`
+    );
+  }
+
   // ── Logging ──
-  const totalChars = prompt.reduce((sum, m) => sum + m.content.length, 0);
   console.log(
     `[model] prompt — ${prompt.length} messages, ${totalChars} chars, ~${Math.round(totalChars / 4)} tokens`
   );
