@@ -115,6 +115,9 @@ export class HaneyChatModel extends BaseChatModel {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 300_000);
 
+    console.log("[model] sending request to MODEL_API");
+    console.time("[model] modal-fetch");
+
     let response: Response;
     try {
       response = await fetch(MODEL_API, {
@@ -125,16 +128,21 @@ export class HaneyChatModel extends BaseChatModel {
       });
     } catch (err: any) {
       clearTimeout(timeout);
+      console.timeEnd("[model] modal-fetch");
       if (err.name === "AbortError") {
+        console.error("[model] timeout — request aborted after 300s");
         throw new Error(
           "Request timed out after 5 minutes. The model is still loading " +
           "on Modal (cold start). Please try again in a moment — the " +
           "container will be warm and respond faster."
         );
       }
+      console.error(`[model] fetch error: ${err.message}`);
       throw err;
     }
     clearTimeout(timeout);
+    console.timeEnd("[model] modal-fetch");
+    console.log("[model] first byte received (response headers)");
 
     if (!response.ok) {
       const errText = await response.text().catch(() => "");
@@ -143,8 +151,13 @@ export class HaneyChatModel extends BaseChatModel {
       );
     }
 
-    // Read the entire body as text first
+    // Read the entire body as text
+    console.time("[model] read-body");
     const raw = await response.text();
+    console.timeEnd("[model] read-body");
+    console.log(
+      `[model] response body received — ${raw.length} raw bytes`
+    );
 
     // Detect format: SSE starts with "data:", plain JSON starts with "{"
     if (raw.trim().startsWith("{")) {

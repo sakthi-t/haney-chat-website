@@ -115,7 +115,17 @@ export async function POST(req: NextRequest) {
       const encoder = new TextEncoder();
       let fullResponse = "";
 
+      // Heartbeat keeps Netlify's gateway alive during Modal cold starts
+      // (container spin-up + model loading can take 60-120s with zero bytes
+      // flowing, which triggers Netlify's 60s idle timeout → 504).
+      const heartbeat = setInterval(() => {
+        controller.enqueue(encoder.encode(": heartbeat\n\n"));
+      }, 10_000);
+
       try {
+        console.log("[api/chat] request received — calling model");
+        console.time("[api/chat] model-stream");
+
         const model = new HaneyChatModel({});
 
         const chunks = model._streamResponseChunks(
@@ -132,6 +142,11 @@ export async function POST(req: NextRequest) {
           controller.enqueue(encoder.encode(sse));
         }
 
+        console.timeEnd("[api/chat] model-stream");
+        console.log(
+          `[api/chat] response completed — ${fullResponse.length} chars`
+        );
+
         // Save assistant message BEFORE sending "done"
         await addMessage(convId, "assistant", fullResponse);
         await touchConversation(convId, userId);
@@ -144,9 +159,11 @@ export async function POST(req: NextRequest) {
         const done = `data: ${JSON.stringify({ done: true, conversationId: convId })}\n\n`;
         controller.enqueue(encoder.encode(done));
       } catch (err: any) {
+        console.error(`[api/chat] error: ${err.message}`);
         const errorSse = `data: ${JSON.stringify({ error: err.message })}\n\n`;
         controller.enqueue(encoder.encode(errorSse));
       } finally {
+        clearInterval(heartbeat);
         controller.close();
       }
     },
