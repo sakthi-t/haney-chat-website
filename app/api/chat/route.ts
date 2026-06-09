@@ -169,6 +169,7 @@ export async function POST(req: NextRequest) {
         );
 
         // ── Fix 4: Log full response before/after strip ──
+        console.log(`[api/chat] fullResponse.length = ${fullResponse.length}`);
         console.log("[api/chat] === FULL RESPONSE (BEFORE DB SAVE) ===");
         console.log(fullResponse);
         console.log("[api/chat] === END FULL RESPONSE ===");
@@ -176,6 +177,14 @@ export async function POST(req: NextRequest) {
         // Save assistant message BEFORE sending "done" — strip tokens
         const cleanedResponse = stripSpecialTokens(fullResponse);
 
+        console.log(
+          `[api/chat] cleanedResponse.length after strip = ${cleanedResponse.length}`
+        );
+        if (fullResponse.length > 0 && cleanedResponse.length === 0) {
+          console.log(
+            "[api/chat] WARNING — fullResponse had content but cleanedResponse is EMPTY after stripSpecialTokens"
+          );
+        }
         console.log("[api/chat] === CLEANED RESPONSE (AFTER STRIP) ===");
         console.log(cleanedResponse);
         console.log("[api/chat] === END CLEANED RESPONSE ===");

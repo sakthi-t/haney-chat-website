@@ -311,12 +311,14 @@ export class HaneyChatModel extends BaseChatModel {
 
         // ── Fix 2: Log before/after strip ──
         console.log("[model] === PARSED CONTENT (BEFORE STRIP) ===");
+        console.log(`[model] rawContent.length = ${rawContent.length}`);
         console.log(rawContent);
         console.log("[model] === END PARSED CONTENT ===");
 
         const content = stripSpecialTokens(rawContent);
 
         console.log("[model] === PARSED CONTENT (AFTER STRIP) ===");
+        console.log(`[model] content.length after strip = ${content.length}`);
         console.log(content);
         console.log("[model] === END STRIPPED CONTENT ===");
         if (content) {
@@ -327,16 +329,27 @@ export class HaneyChatModel extends BaseChatModel {
           // background tabs, which would stall 2000+ chars for
           // 8+ minutes and freeze the UI).
           const words = content.split(/(\s+)/);
+          const nonEmpty = words.filter(Boolean);
           console.log(
-            `[model] response parsed — ${content.length} chars, ${words.filter(Boolean).length} words`
+            `[model] response parsed — ${content.length} chars, ${nonEmpty.length} words, about to yield ${nonEmpty.length} chunks`
           );
+          let chunkIndex = 0;
           for (const word of words) {
             if (!word) continue;
+            chunkIndex++;
+            console.log(
+              `[model] yielding chunk #${chunkIndex}/${nonEmpty.length}: "${word.slice(0, 80)}"...`
+            );
             yield new ChatGenerationChunk({
               text: word,
               message: new AIMessageChunk(word),
             });
           }
+          console.log(`[model] yielded ${chunkIndex} chunks total`);
+        } else {
+          console.log(
+            `[model] WARNING — content empty after strip (rawContent had ${rawContent.length} chars) — zero chunks yielded`
+          );
         }
       } catch {
         // ignore parse errors — no chunks yielded
@@ -346,6 +359,9 @@ export class HaneyChatModel extends BaseChatModel {
 
     // ── True SSE stream ──
     const lines = raw.split("\n");
+
+    console.log(`[model] SSE stream — ${lines.length} raw lines`);
+    let sseChunkIndex = 0;
 
     for (const line of lines) {
       const trimmed = line.trim();
@@ -361,8 +377,17 @@ export class HaneyChatModel extends BaseChatModel {
           choice?.message?.content ??
           "";
         const delta = stripSpecialTokens(rawDelta);
+        if (rawDelta && !delta) {
+          console.log(
+            `[model] SSE chunk — rawDelta ${rawDelta.length} chars → EMPTY after strip`
+          );
+        }
         if (!delta) continue;
 
+        sseChunkIndex++;
+        console.log(
+          `[model] yielding SSE chunk #${sseChunkIndex}: "${delta.slice(0, 80)}"`
+        );
         yield new ChatGenerationChunk({
           text: delta,
           message: new AIMessageChunk(delta),
@@ -371,5 +396,6 @@ export class HaneyChatModel extends BaseChatModel {
         // skip malformed JSON lines
       }
     }
+    console.log(`[model] yielded ${sseChunkIndex} SSE chunks total`);
   }
 }
