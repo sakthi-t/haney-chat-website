@@ -16,6 +16,8 @@ export default function ChatPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const pendingRef = useRef<string>("");
+  const rafRef = useRef<number | null>(null);
 
   // Track which conversation the currently-displayed messages belong to.
   const loadedConvRef = useRef<string | undefined>(undefined);
@@ -92,6 +94,10 @@ export default function ChatPage() {
       };
       setMessages((prev) => [...prev, assistantMsg]);
 
+      // Abort any previous streaming request still in flight
+      abortRef.current?.abort();
+      console.log("[chat-page] sending message to API");
+
       const abort = new AbortController();
       abortRef.current = abort;
 
@@ -141,18 +147,30 @@ export default function ChatPage() {
               if (parsed.done) {
                 newConvId = parsed.conversationId;
               } else if (parsed.delta) {
-                setMessages((prev) => {
-                  const updated = [...prev];
-                  const lastIdx = updated.length - 1;
-                  const last = updated[lastIdx];
-                  if (last && last.role === "assistant") {
-                    updated[lastIdx] = {
-                      ...last,
-                      content: last.content + parsed.delta,
-                    };
-                  }
-                  return updated;
-                });
+                // Batch deltas with requestAnimationFrame — avoids
+                // hundreds of React re-renders per second (and
+                // ReactMarkdown re-parsing partial markdown on
+                // every keystroke-level chunk).
+                pendingRef.current += parsed.delta;
+                if (rafRef.current === null) {
+                  rafRef.current = requestAnimationFrame(() => {
+                    rafRef.current = null;
+                    const batched = pendingRef.current;
+                    pendingRef.current = "";
+                    setMessages((prev) => {
+                      const updated = [...prev];
+                      const lastIdx = updated.length - 1;
+                      const last = updated[lastIdx];
+                      if (last && last.role === "assistant") {
+                        updated[lastIdx] = {
+                          ...last,
+                          content: last.content + batched,
+                        };
+                      }
+                      return updated;
+                    });
+                  });
+                }
               } else if (parsed.error) {
                 setError(parsed.error);
               }
@@ -162,16 +180,45 @@ export default function ChatPage() {
           }
         }
 
-        // Mark streaming complete
-        setMessages((prev) => {
-          const updated = [...prev];
-          const lastIdx = updated.length - 1;
-          const last = updated[lastIdx];
-          if (last && last.role === "assistant") {
-            updated[lastIdx] = { ...last, isStreaming: false };
-          }
-          return updated;
-        });
+        // Flush any remaining batched deltas, then mark complete.
+        // Handles both normal SSE "done" events AND truncated
+        // streams where the server never sends "done".
+        if (rafRef.current !== null) {
+          cancelAnimationFrame(rafRef.current);
+          rafRef.current = null;
+        }
+        if (pendingRef.current) {
+          const remaining = pendingRef.current;
+          pendingRef.current = "";
+          setMessages((prev) => {
+            const updated = [...prev];
+            const lastIdx = updated.length - 1;
+            const last = updated[lastIdx];
+            if (last && last.role === "assistant") {
+              updated[lastIdx] = {
+                ...last,
+                content: last.content + remaining,
+                isStreaming: false,
+              };
+            }
+            return updated;
+          });
+          console.log("[chat-page] SSE stream ended — flushed remaining delta");
+        } else {
+          setMessages((prev) => {
+            const updated = [...prev];
+            const lastIdx = updated.length - 1;
+            const last = updated[lastIdx];
+            if (last && last.role === "assistant") {
+              updated[lastIdx] = { ...last, isStreaming: false };
+            }
+            return updated;
+          });
+          console.log(
+            "[chat-page] SSE stream ended — complete" +
+              (newConvId ? `, conv=${newConvId}` : "")
+          );
+        }
 
         // Navigate to the new conversation if this was a fresh chat
         if (newConvId && !conversationId) {
@@ -179,9 +226,18 @@ export default function ChatPage() {
           router.replace(`/chat/${newConvId}`);
         }
       } catch (err: any) {
-        if (err.name === "AbortError") return;
-        console.error("Chat error:", err);
+        if (err.name === "AbortError") {
+          console.log("[chat-page] request aborted");
+          return;
+        }
+        console.error(`[chat-page] error: ${err.message || "Unknown"}`);
         setError(err.message || "Something went wrong");
+        // Cancel pending RAF and clear batched deltas
+        if (rafRef.current !== null) {
+          cancelAnimationFrame(rafRef.current);
+          rafRef.current = null;
+        }
+        pendingRef.current = "";
         // Remove streaming placeholder on error
         setMessages((prev) => {
           const last = prev[prev.length - 1];

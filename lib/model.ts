@@ -166,17 +166,22 @@ export class HaneyChatModel extends BaseChatModel {
         const data: ModalChatResponse = JSON.parse(raw);
         const content = data.choices?.[0]?.message?.content ?? "";
         if (content) {
-          // Stream the content character-by-character so the client
-          // still sees a "typing" effect even though we have the full
-          // response already.
-          for (let i = 0; i < content.length; i++) {
-            const char = content[i]!;
+          // Yield word-by-word instead of character-by-character.
+          // No artificial delay — yields as fast as the consumer
+          // reads, avoiding background-tab setTimeout throttling
+          // (browsers clamp sub-second timers to 1000ms in
+          // background tabs, which would stall 2000+ chars for
+          // 8+ minutes and freeze the UI).
+          const words = content.split(/(\s+)/);
+          console.log(
+            `[model] response parsed — ${content.length} chars, ${words.filter(Boolean).length} words`
+          );
+          for (const word of words) {
+            if (!word) continue;
             yield new ChatGenerationChunk({
-              text: char,
-              message: new AIMessageChunk(char),
+              text: word,
+              message: new AIMessageChunk(word),
             });
-            // Tiny delay for visible streaming effect
-            await new Promise((r) => setTimeout(r, 3));
           }
         }
       } catch {
