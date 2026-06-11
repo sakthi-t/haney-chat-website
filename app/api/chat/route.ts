@@ -141,7 +141,6 @@ export async function POST(req: NextRequest) {
         encoder.encode(
           `data: ${JSON.stringify({
             _debug: {
-              MODEL_API: (process.env.MODEL_API || "UNDEFINED").slice(0, 100),
               MODEL_MAX_TOKENS: process.env.MODEL_MAX_TOKENS || "default 256",
               NODE_ENV: process.env.NODE_ENV,
             },
