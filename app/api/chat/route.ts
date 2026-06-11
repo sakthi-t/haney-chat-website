@@ -136,6 +136,19 @@ export async function POST(req: NextRequest) {
       const encoder = new TextEncoder();
       let fullResponse = "";
 
+      // ── TEMPORARY DEBUG: surface env vars & config to browser Network tab ──
+      controller.enqueue(
+        encoder.encode(
+          `data: ${JSON.stringify({
+            _debug: {
+              MODEL_API: (process.env.MODEL_API || "UNDEFINED").slice(0, 100),
+              MODEL_MAX_TOKENS: process.env.MODEL_MAX_TOKENS || "default 256",
+              NODE_ENV: process.env.NODE_ENV,
+            },
+          })}\n\n`
+        )
+      );
+
       // Heartbeat keeps Netlify's gateway alive during Modal cold starts
       // (container spin-up + model loading can take 60-120s with zero bytes
       // flowing, which triggers Netlify's 60s idle timeout → 504).
@@ -191,6 +204,18 @@ export async function POST(req: NextRequest) {
 
         await addMessage(convId, "assistant", cleanedResponse);
         await touchConversation(convId, userId);
+
+        // ── TEMPORARY DEBUG: surface stream outcome to browser ──
+        controller.enqueue(
+          encoder.encode(
+            `data: ${JSON.stringify({
+              _debug: {
+                fullResponseLen: fullResponse.length,
+                cleanedLen: cleanedResponse.length,
+              },
+            })}\n\n`
+          )
+        );
 
         if (fullResponse.length === 0) {
           const errSse = `data: ${JSON.stringify({ error: "Model returned an empty response. Please try again." })}\n\n`;

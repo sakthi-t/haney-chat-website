@@ -347,9 +347,12 @@ export class HaneyChatModel extends BaseChatModel {
       }
       console.log(`[model] yielded ${chunkIndex} chunks total`);
     } else {
-      console.log(
-        `[model] WARNING — content empty after strip (rawContent had ${rawContent.length} chars) — zero chunks yielded`
-      );
+      const errMsg =
+        `Model response empty after stripping special tokens. ` +
+        `Raw response had ${rawContent.length} chars. ` +
+        `Raw: "${rawContent.slice(0, 500)}"`;
+      console.error(`[model] ${errMsg}`);
+      throw new Error(errMsg);
     }
   }
 }

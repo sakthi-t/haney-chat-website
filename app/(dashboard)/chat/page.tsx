@@ -132,6 +132,11 @@ export default function ChatPage() {
           if (done) break;
 
           buffer += decoder.decode(value, { stream: true });
+          // ── TEMPORARY DEBUG: log every raw SSE chunk to browser console ──
+          console.log(
+            `[chat-page] RAW SSE chunk (${value.length}B):`,
+            decoder.decode(value, { stream: false })
+          );
           const lines = buffer.split("\n");
           buffer = lines.pop() ?? "";
 
@@ -143,6 +148,13 @@ export default function ChatPage() {
 
             try {
               const parsed = JSON.parse(jsonStr);
+
+              // ── TEMPORARY DEBUG: log every parsed SSE event ──
+              console.log("[chat-page] PARSED SSE:", parsed);
+              if (parsed._debug) {
+                console.log(`[chat-page] 🔍 SERVER DEBUG:`, parsed._debug);
+                continue;
+              }
 
               if (parsed.done) {
                 newConvId = parsed.conversationId;
