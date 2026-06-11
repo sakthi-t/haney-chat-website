@@ -215,6 +215,19 @@ export default async function DashboardLayout({
               }
             />
           </div>
+          <div className="px-3 pb-3">
+            <p className="text-[10px] text-zinc-600 text-center">
+              <a
+                href="https://www.flaticon.com/free-icons/kitty"
+                title="kitty icons"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="hover:text-zinc-400 transition-colors"
+              >
+                Kitty icons by Mihimihi — Flaticon
+              </a>
+            </p>
+          </div>
         </div>
       </aside>
 

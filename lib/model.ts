@@ -3,7 +3,6 @@ import {
   AIMessage,
   AIMessageChunk,
   BaseMessage,
-  ChatMessage,
   HumanMessage,
   SystemMessage,
 } from "@langchain/core/messages";
@@ -11,22 +10,14 @@ import { ChatResult, ChatGenerationChunk } from "@langchain/core/outputs";
 import { CallbackManagerForLLMRun } from "@langchain/core/callbacks/manager";
 
 const MODEL_API = process.env.MODEL_API!;
+const MODEL_MAX_TOKENS = parseInt(process.env.MODEL_MAX_TOKENS ?? "256", 10);
 
-interface ModalChatChoice {
-  index: number;
-  message: {
-    role: string;
-    content: string;
-  };
-  finish_reason?: string | null;
-}
+// ── Response format for v2 endpoint ────────────────────────────────────
+// POST { prompt: string, max_tokens: number }
+// Response: { response: string }
 
-interface ModalChatResponse {
-  id?: string;
-  object?: string;
-  created?: number;
-  model?: string;
-  choices: ModalChatChoice[];
+interface ModalGenerateResponse {
+  response: string;
 }
 
 // ── Special token stripping ────────────────────────────────────────────
@@ -111,68 +102,77 @@ export function stripSpecialTokens(text: string): string {
   return cleaned.replace(/\s{2,}/g, " ").trim();
 }
 
-function convertLangChainMessageToModal(
-  msg: BaseMessage
-): { role: string; content: string } {
+/**
+ * Format a single message into a role-prefixed line for the prompt string.
+ */
+function formatMessageForPrompt(msg: BaseMessage): string {
   const content = stripSpecialTokens(msg.content as string);
 
+  if (msg instanceof SystemMessage) {
+    return `System: ${content}`;
+  }
   if (msg instanceof HumanMessage) {
-    return { role: "user", content };
+    return `User: ${content}`;
   }
   if (msg instanceof AIMessage) {
-    return { role: "assistant", content };
+    return `Assistant: ${content}`;
   }
-  if (msg instanceof SystemMessage) {
-    return { role: "system", content };
-  }
-  // Fallback — treat _getType() as role
-  const role = msg._getType?.() ?? "user";
-  return { role: role === "ai" ? "assistant" : role, content };
+  // Fallback
+  const type = msg._getType?.();
+  if (type === "system") return `System: ${content}`;
+  if (type === "ai") return `Assistant: ${content}`;
+  return `User: ${content}`;
 }
 
 /**
- * Build the full prompt array for a request — prepends system prompt
- * and sanitises every message.  Also logs prompt details for debugging.
+ * Build the full prompt string for a request.
+ *
+ * Formats the conversation as:
+ *   System: ...
+ *   User: ...
+ *   Assistant: ...
+ *   User: ...
+ *   Assistant:    <-- model should complete this
+ *
+ * Uses a sliding window to keep the prompt within reasonable bounds.
  */
-function buildPrompt(messages: BaseMessage[]): { role: string; content: string }[] {
-  const all: BaseMessage[] = [
-    new SystemMessage(SYSTEM_PROMPT),
-    ...messages,
-  ];
+function buildPrompt(messages: BaseMessage[]): string {
+  const systemLine = `System: ${SYSTEM_PROMPT}`;
+  const allMessages = messages.map(formatMessageForPrompt);
 
-  const prompt = all.map(convertLangChainMessageToModal);
+  // ── Sliding window: drop oldest non-system messages if too long ──
+  // Appending "Assistant:" at the end signals the model to respond.
+  const PROMPT_SUFFIX = "\nAssistant:";
+  const MAX_PROMPT_CHARS = 1500;
 
-  // ── Sliding window: keep newest messages, drop oldest ──
-  // Modal truncates prompt to 1000 chars. We budget 850 for content,
-  // leaving ~150 for JSON overhead (keys, quotes, braces, field names).
-  const MAX_CONTENT_CHARS = 850;
-  let totalChars = prompt.reduce((sum, m) => sum + m.content.length, 0);
+  // Build progressively and truncate from the top if needed
+  let body = allMessages.join("\n\n");
+  let total = systemLine.length + body.length + PROMPT_SUFFIX.length;
+
   let dropped = 0;
-
-  // Always keep the system message (index 0) and the last 2 non-system
-  // messages so the newest user→assistant exchange is always preserved.
-  while (totalChars > MAX_CONTENT_CHARS && prompt.length > 3) {
-    // Remove the oldest non-system message (index 1 — right after system)
-    const removed = prompt.splice(1, 1)[0]!;
-    totalChars -= removed.content.length;
+  // Drop oldest messages one by one until we fit (keep at least last 2)
+  while (total > MAX_PROMPT_CHARS && allMessages.length > 2) {
+    const removed = allMessages.shift()!;
+    body = allMessages.join("\n\n");
+    total = systemLine.length + body.length + PROMPT_SUFFIX.length;
     dropped++;
   }
+
+  const prompt = `${systemLine}\n\n${body}${PROMPT_SUFFIX}`;
 
   if (dropped > 0) {
     console.log(
       `[model] prompt truncated — dropped ${dropped} oldest message(s), ` +
-      `${prompt.length} remaining, ${totalChars} chars (budget: ${MAX_CONTENT_CHARS})`
+      `${allMessages.length} messages remaining, ${prompt.length} chars (budget: ${MAX_PROMPT_CHARS})`
     );
   }
 
   // ── Logging ──
   console.log(
-    `[model] prompt — ${prompt.length} messages, ${totalChars} chars, ~${Math.round(totalChars / 4)} tokens`
+    `[model] prompt — ${allMessages.length + 1} entries (system + ${allMessages.length} messages), ${prompt.length} chars, ~${Math.round(prompt.length / 4)} tokens`
   );
-  console.log("[model] === FINAL PROMPT ARRAY (SENT TO MODAL) ===");
-  prompt.forEach((m, i) => {
-    console.log(`[${i}] ${m.role}: ${m.content}`);
-  });
+  console.log("[model] === FINAL PROMPT (SENT TO MODAL) ===");
+  console.log(prompt.length > 2000 ? prompt.slice(0, 2000) + "..." : prompt);
   console.log("[model] === END FINAL PROMPT ===");
 
   return prompt;
@@ -180,7 +180,7 @@ function buildPrompt(messages: BaseMessage[]): { role: string; content: string }
 
 /**
  * HaneyChatModel — custom LangChain Chat Model adapter for the Haney Chat
- * Modal inference endpoint (OpenAI-compatible request/response format).
+ * Modal inference endpoint (v2 — prompt/max_tokens format).
  */
 export class HaneyChatModel extends BaseChatModel {
   // ── required BaseChatModel fields ──
@@ -190,16 +190,20 @@ export class HaneyChatModel extends BaseChatModel {
 
   lc_namespace = ["haney", "chat"];
 
-  // ── the actual LLM call ──
+  // ── the actual LLM call (non-streaming) ──
   async _generate(
     messages: BaseMessage[],
     _options: this["ParsedCallOptions"],
     _runManager?: CallbackManagerForLLMRun
   ): Promise<ChatResult> {
     const body = {
-      model: "haney-chat",
-      messages: buildPrompt(messages),
+      prompt: buildPrompt(messages),
+      max_tokens: MODEL_MAX_TOKENS,
     };
+
+    console.log("[model] === FULL REQUEST BODY ===");
+    console.log(JSON.stringify({ ...body, prompt: body.prompt.slice(0, 200) + "..." }, null, 2));
+    console.log("[model] === END REQUEST BODY ===");
 
     const response = await fetch(MODEL_API, {
       method: "POST",
@@ -210,13 +214,13 @@ export class HaneyChatModel extends BaseChatModel {
     if (!response.ok) {
       const errText = await response.text().catch(() => "");
       throw new Error(
-        `Haney Chat API returned ${response.status}: ${errText}`
+        `Haney Chat API returned ${response.status}: ${errText.slice(0, 500)}`
       );
     }
 
-    const data: ModalChatResponse = await response.json();
+    const data: ModalGenerateResponse = await response.json();
 
-    const rawContent = data.choices?.[0]?.message?.content ?? "";
+    const rawContent = data.response ?? "";
     const content = stripSpecialTokens(rawContent);
     const message = new AIMessage(content);
 
@@ -226,11 +230,11 @@ export class HaneyChatModel extends BaseChatModel {
   }
 
   /**
-   * Streaming implementation — reads the response from Modal and yields
-   * AIMessageChunks.
+   * Streaming implementation — calls the v2 endpoint (non-streaming) and
+   * simulates token-by-token output by yielding words.
    *
-   * Detects whether the Modal endpoint returns SSE (data: lines) or plain
-   * JSON (it ignores stream:true).  Either way we produce chunks.
+   * The v2 endpoint returns plain JSON { response: "..." }.
+   * We yield word-by-word so the frontend still gets progressive rendering.
    */
   async *_streamResponseChunks(
     messages: BaseMessage[],
@@ -238,9 +242,8 @@ export class HaneyChatModel extends BaseChatModel {
     _runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
     const body = {
-      model: "haney-chat",
-      messages: buildPrompt(messages),
-      stream: true,
+      prompt: buildPrompt(messages),
+      max_tokens: MODEL_MAX_TOKENS,
     };
 
     // 5-minute timeout — Modal cold starts (container spin-up + model
@@ -248,9 +251,11 @@ export class HaneyChatModel extends BaseChatModel {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 300_000);
 
-    // ── Fix 2: Log exact request body ──
     console.log("[model] === FULL REQUEST BODY ===");
-    console.log(JSON.stringify(body, null, 2));
+    console.log(JSON.stringify(
+      { ...body, prompt: body.prompt.length > 300 ? body.prompt.slice(0, 300) + "..." : body.prompt },
+      null, 2
+    ));
     console.log("[model] === END REQUEST BODY ===");
 
     console.log("[model] sending request to MODEL_API");
@@ -280,122 +285,71 @@ export class HaneyChatModel extends BaseChatModel {
     }
     clearTimeout(timeout);
     console.timeEnd("[model] modal-fetch");
-    console.log("[model] first byte received (response headers)");
+    console.log("[model] response received");
 
     if (!response.ok) {
       const errText = await response.text().catch(() => "");
       throw new Error(
-        `Haney Chat API returned ${response.status}: ${errText.slice(0, 200)}`
+        `Haney Chat API returned ${response.status}: ${errText.slice(0, 500)}`
       );
     }
 
-    // Read the entire body as text
-    console.time("[model] read-body");
+    // Read the entire response body
     const raw = await response.text();
-    console.timeEnd("[model] read-body");
     console.log(
-      `[model] response body received — ${raw.length} raw bytes`
+      `[model] response body — ${raw.length} raw bytes`
     );
-
-    // ── Fix 2: Log raw response ──
-    console.log("[model] === RAW RESPONSE FROM MODAL ===");
-    console.log(raw.length > 3000 ? raw.slice(0, 3000) + "..." : raw);
+    console.log("[model] === RAW RESPONSE ===");
+    console.log(raw.length > 2000 ? raw.slice(0, 2000) + "..." : raw);
     console.log("[model] === END RAW RESPONSE ===");
 
-    // Detect format: SSE starts with "data:", plain JSON starts with "{"
-    if (raw.trim().startsWith("{")) {
-      // ── Plain JSON (Modal ignores stream:true) ──
-      try {
-        const data: ModalChatResponse = JSON.parse(raw);
-        const rawContent = data.choices?.[0]?.message?.content ?? "";
-
-        // ── Fix 2: Log before/after strip ──
-        console.log("[model] === PARSED CONTENT (BEFORE STRIP) ===");
-        console.log(`[model] rawContent.length = ${rawContent.length}`);
-        console.log(rawContent);
-        console.log("[model] === END PARSED CONTENT ===");
-
-        const content = stripSpecialTokens(rawContent);
-
-        console.log("[model] === PARSED CONTENT (AFTER STRIP) ===");
-        console.log(`[model] content.length after strip = ${content.length}`);
-        console.log(content);
-        console.log("[model] === END STRIPPED CONTENT ===");
-        if (content) {
-          // Yield word-by-word instead of character-by-character.
-          // No artificial delay — yields as fast as the consumer
-          // reads, avoiding background-tab setTimeout throttling
-          // (browsers clamp sub-second timers to 1000ms in
-          // background tabs, which would stall 2000+ chars for
-          // 8+ minutes and freeze the UI).
-          const words = content.split(/(\s+)/);
-          const nonEmpty = words.filter(Boolean);
-          console.log(
-            `[model] response parsed — ${content.length} chars, ${nonEmpty.length} words, about to yield ${nonEmpty.length} chunks`
-          );
-          let chunkIndex = 0;
-          for (const word of words) {
-            if (!word) continue;
-            chunkIndex++;
-            console.log(
-              `[model] yielding chunk #${chunkIndex}/${nonEmpty.length}: "${word.slice(0, 80)}"...`
-            );
-            yield new ChatGenerationChunk({
-              text: word,
-              message: new AIMessageChunk(word),
-            });
-          }
-          console.log(`[model] yielded ${chunkIndex} chunks total`);
-        } else {
-          console.log(
-            `[model] WARNING — content empty after strip (rawContent had ${rawContent.length} chars) — zero chunks yielded`
-          );
-        }
-      } catch {
-        // ignore parse errors — no chunks yielded
-      }
+    // Parse JSON response
+    let data: ModalGenerateResponse;
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      console.error("[model] failed to parse response JSON");
       return;
     }
 
-    // ── True SSE stream ──
-    const lines = raw.split("\n");
+    const rawContent = data.response ?? "";
 
-    console.log(`[model] SSE stream — ${lines.length} raw lines`);
-    let sseChunkIndex = 0;
+    console.log("[model] === PARSED CONTENT (BEFORE STRIP) ===");
+    console.log(`[model] rawContent.length = ${rawContent.length}`);
+    console.log(rawContent.length > 1000 ? rawContent.slice(0, 1000) + "..." : rawContent);
+    console.log("[model] === END PARSED CONTENT ===");
 
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || !trimmed.startsWith("data:")) continue;
-      const jsonStr = trimmed.slice(5).trim();
-      if (jsonStr === "[DONE]") break;
+    const content = stripSpecialTokens(rawContent);
 
-      try {
-        const chunk = JSON.parse(jsonStr) as ModalChatResponse;
-        const choice = chunk.choices?.[0];
-        const rawDelta =
-          (choice as any)?.delta?.content ??
-          choice?.message?.content ??
-          "";
-        const delta = stripSpecialTokens(rawDelta);
-        if (rawDelta && !delta) {
-          console.log(
-            `[model] SSE chunk — rawDelta ${rawDelta.length} chars → EMPTY after strip`
-          );
-        }
-        if (!delta) continue;
+    console.log("[model] === PARSED CONTENT (AFTER STRIP) ===");
+    console.log(`[model] content.length after strip = ${content.length}`);
+    console.log(content.length > 1000 ? content.slice(0, 1000) + "..." : content);
+    console.log("[model] === END STRIPPED CONTENT ===");
 
-        sseChunkIndex++;
-        console.log(
-          `[model] yielding SSE chunk #${sseChunkIndex}: "${delta.slice(0, 80)}"`
-        );
+    if (content) {
+      // Yield word-by-word — no artificial delay, yields as fast as the
+      // consumer reads.  This avoids background-tab setTimeout throttling
+      // (browsers clamp sub-second timers to 1000ms in background tabs,
+      // which would freeze the UI for minutes for long responses).
+      const words = content.split(/(\s+)/);
+      const nonEmpty = words.filter(Boolean);
+      console.log(
+        `[model] response parsed — ${content.length} chars, ${nonEmpty.length} words, yielding ${nonEmpty.length} chunks`
+      );
+      let chunkIndex = 0;
+      for (const word of words) {
+        if (!word) continue;
+        chunkIndex++;
         yield new ChatGenerationChunk({
-          text: delta,
-          message: new AIMessageChunk(delta),
+          text: word,
+          message: new AIMessageChunk(word),
         });
-      } catch {
-        // skip malformed JSON lines
       }
+      console.log(`[model] yielded ${chunkIndex} chunks total`);
+    } else {
+      console.log(
+        `[model] WARNING — content empty after strip (rawContent had ${rawContent.length} chars) — zero chunks yielded`
+      );
     }
-    console.log(`[model] yielded ${sseChunkIndex} SSE chunks total`);
   }
 }

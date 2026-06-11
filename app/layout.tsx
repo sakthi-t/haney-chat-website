@@ -3,6 +3,7 @@ import { Geist, Geist_Mono, Inter } from "next/font/google";
 import "./globals.css";
 import { cn } from "@/lib/utils";
 import { ClerkProvider } from "@clerk/nextjs";
+import { Footer } from "@/components/footer";
 
 const inter = Inter({ subsets: ["latin"], variable: "--font-sans" });
 
@@ -44,7 +45,9 @@ export const metadata: Metadata = {
     follow: true,
   },
   icons: {
-    icon: "/favicon.ico",
+    icon: [
+      { url: "/favicon.png", type: "image/png", sizes: "512x512" },
+    ],
   },
 };
 
@@ -79,6 +82,7 @@ export default function RootLayout({
       >
         <body className="min-h-full flex flex-col bg-zinc-950 text-white">
           {children}
+          <Footer />
         </body>
       </html>
     </ClerkProvider>
